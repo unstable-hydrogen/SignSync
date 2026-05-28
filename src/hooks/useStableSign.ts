@@ -1,132 +1,138 @@
 /**
- * useStableSign — temporal smoothing + hysteresis for ASL letter output.
+ * useStableSign — Prediction Smoothing Layer
  *
- * ── Problem ──────────────────────────────────────────────────────────────────
- * Raw per-frame scores fluctuate even for a held gesture because MediaPipe
- * jitters slightly between frames, and a partially-formed hand shape can flip
- * between two high-scoring letters rapidly.
+ * ── Why stability matters in real-time vision ────────────────────────────────
+ * Raw per-frame scores are noisy.  Even for a perfectly held sign, MediaPipe
+ * jitters slightly between frames, and transitional hand poses during sign
+ * changes can briefly score high for a wrong letter.  Without smoothing you get:
+ *   A → flicker to B for 2 frames → back to A → feels broken
  *
- * ── Solution: two-stage filter ───────────────────────────────────────────────
+ * ── Two-stage filter ─────────────────────────────────────────────────────────
  *
- *  Stage 1 — EMA smoothing (per letter)
- *    smoothed[l] = α × raw[l] + (1−α) × smoothed[l]
- *    α = 0.22  → a spike lasts ~4–5 frames before decaying; a held sign
- *    reaches 95 % of its true score in ~12 frames (~0.4 s at 30 fps).
- *    Letters not detected this frame get raw = 0 and decay automatically.
+ * Stage 1 — Exponential Moving Average (EMA) per letter:
  *
- *  Stage 2 — commit / release hysteresis
- *    Commit:  smoothed winner > COMMIT_THRESHOLD for COMMIT_FRAMES consecutive frames.
- *    Release: currently displayed sign drops below RELEASE_THRESHOLD.
- *    The gap between thresholds (0.58 → 0.33) prevents rapid on/off flickering
- *    when confidence hovers at the boundary.
+ *   smoothed[L] = α × raw[L] + (1−α) × smoothed[L]
  *
- * ── Return value ─────────────────────────────────────────────────────────────
- *   sign         — the currently committed letter, or null if none.
- *   confidence   — smoothed score of the displayed sign (0–1).
- *   isStable     — true once the sign has been held for COMMIT_FRAMES.
- *                  false = "candidate" — a sign is accumulating but not yet locked.
+ *   α = 0.22 ("learning rate").  A single-frame spike takes ~5 frames to
+ *   decay to 50 % of its original value.  A genuinely held sign reaches
+ *   95 % of its true score in ~12 frames (~0.4 s at 30 fps).
+ *   Letters not detected this frame get raw = 0, so they decay automatically.
+ *
+ * Stage 2 — Commit / Release hysteresis:
+ *
+ *   Commit:  winner's smoothed score > COMMIT_THRESHOLD for COMMIT_FRAMES
+ *            consecutive frames.
+ *   Release: currently displayed sign's score drops below RELEASE_THRESHOLD.
+ *
+ *   The gap between thresholds (0.58 → 0.33) prevents rapid on/off at the
+ *   boundary — a classic "Schmitt trigger" pattern from electronics.
+ *
+ * ── Synchronous return value ─────────────────────────────────────────────────
+ * update() returns the new StableResult immediately (in addition to queuing
+ * a React state update for rendering).  This lets the caller (HandTracker)
+ * pass the result to the word builder in the SAME animation frame, with zero
+ * lag.  The React state is only needed to trigger a re-render.
  */
 
 import { useRef, useState, useCallback } from "react";
 import { ALL_SIGNS, type Sign, type ScoreMap } from "../classifier/classifySign";
 
 export interface StableResult {
-  sign: Sign | null;
-  confidence: number;
-  isStable: boolean;
+  sign:       Sign | null; // currently displayed letter (null = nothing confident)
+  confidence: number;      // smoothed score of the displayed sign, 0–1
+  isStable:   boolean;     // true once held for COMMIT_FRAMES (green dot in UI)
 }
 
-const EMA_ALPHA       = 0.22;  // smoothing weight
-const COMMIT_THRESHOLD = 0.58; // smoothed score required to start committing
-const RELEASE_THRESHOLD = 0.33; // committed sign cleared below this
-const COMMIT_FRAMES   = 7;     // consecutive frames above threshold before lock
+const EMA_ALPHA        = 0.22;
+const COMMIT_THRESHOLD = 0.58; // smoothed score needed to start displaying / accumulating
+const RELEASE_THRESHOLD = 0.33; // committed sign is cleared below this
+const COMMIT_FRAMES    = 7;    // consecutive frames above threshold before locking
 
-const ZERO_SCORES = Object.fromEntries(ALL_SIGNS.map(s => [s, 0])) as ScoreMap;
+const INITIAL: StableResult = { sign: null, confidence: 0, isStable: false };
 
 export function useStableSign() {
-  // Smoothed score per letter — lives in a ref so the animation loop never
-  // sees a stale closure (unlike useState, ref mutations are synchronous).
-  const smoothed    = useRef<ScoreMap>({ ...ZERO_SCORES });
-  const stableCount = useRef(0);           // consecutive frames same candidate is winning
-  const pendingSign = useRef<Sign | null>(null); // sign currently accumulating
+  // Smoothed scores live in a ref — they update every frame but don't need
+  // to trigger React renders by themselves.
+  const smoothed    = useRef<ScoreMap>(
+    Object.fromEntries(ALL_SIGNS.map(s => [s, 0])) as ScoreMap
+  );
+  const stableCount = useRef(0);
+  const pendingSign = useRef<Sign | null>(null);
 
-  const [result, setResult] = useState<StableResult>({
-    sign: null,
-    confidence: 0,
-    isStable: false,
-  });
+  // resultRef holds the current logical result (used for synchronous reads).
+  // result (state) is the React-reactive copy used for rendering.
+  const resultRef = useRef<StableResult>(INITIAL);
+  const [result, setResult] = useState<StableResult>(INITIAL);
 
   /**
-   * update — call this once per animation frame with the raw per-letter scores.
-   * Pass all-zeros (ZERO_SCORES) when no hand is in frame so letters decay.
+   * update — call once per animation frame with raw per-letter scores.
+   *
+   * Returns the new StableResult synchronously so callers in the same
+   * frame (e.g., the word builder) don't need to wait for a React re-render.
    */
-  const update = useCallback((scores: ScoreMap) => {
-    const sm = smoothed.current;
+  const update = useCallback((scores: ScoreMap): StableResult => {
+    const sm   = smoothed.current;
+    const prev = resultRef.current;
 
-    // ── Stage 1: EMA ──────────────────────────────────────────────────────
+    // ── Stage 1: EMA update ─────────────────────────────────────────────────
     for (const sign of ALL_SIGNS) {
       sm[sign] = EMA_ALPHA * scores[sign] + (1 - EMA_ALPHA) * sm[sign];
     }
 
-    // ── Find the smoothed winner ───────────────────────────────────────────
+    // ── Find smoothed winner ────────────────────────────────────────────────
     let topSign: Sign | null = null;
     let topConf = 0;
     for (const sign of ALL_SIGNS) {
-      if (sm[sign] > topConf) {
-        topConf = sm[sign];
-        topSign = sign;
-      }
+      if (sm[sign] > topConf) { topConf = sm[sign]; topSign = sign; }
     }
-    // Suppress if below threshold — nothing confident enough to consider.
-    if (topConf < COMMIT_THRESHOLD) topSign = null;
+    if (topConf < COMMIT_THRESHOLD) topSign = null; // not confident enough
 
-    // ── Stage 2: commit counter ────────────────────────────────────────────
+    // ── Stage 2: consecutive-frame counter ─────────────────────────────────
     if (topSign === pendingSign.current) {
       stableCount.current++;
     } else {
-      // A different sign (or null) is now leading — restart the counter.
       stableCount.current = 1;
       pendingSign.current = topSign;
     }
-
     const isNowStable = stableCount.current >= COMMIT_FRAMES;
 
-    // ── Update display state ───────────────────────────────────────────────
-    setResult(prev => {
-      // Case A: we have a stable new winner → commit to it.
-      if (isNowStable && topSign !== null && topSign !== prev.sign) {
-        return { sign: topSign, confidence: topConf, isStable: true };
+    // ── Compute new result ──────────────────────────────────────────────────
+    let next: StableResult;
+
+    if (isNowStable && topSign !== null && topSign !== prev.sign) {
+      // Lock in a newly committed sign
+      next = { sign: topSign, confidence: topConf, isStable: true };
+
+    } else if (prev.sign !== null) {
+      const currentConf = sm[prev.sign];
+
+      if (currentConf < RELEASE_THRESHOLD) {
+        // Committed sign has decayed — clear it
+        next = INITIAL;
+      } else if (prev.sign === topSign) {
+        // Refresh confidence of the current sign
+        next = { ...prev, confidence: topConf, isStable: isNowStable };
+      } else {
+        // A different sign is accumulating; keep showing the committed one
+        next = { ...prev, confidence: currentConf };
       }
 
-      // Case B: currently showing a committed sign.
-      if (prev.sign !== null) {
-        const currentConf = sm[prev.sign];
+    } else if (topSign !== null && topConf >= COMMIT_THRESHOLD) {
+      // Nothing committed yet — show candidate dimly while accumulating
+      next = { sign: topSign, confidence: topConf, isStable: false };
 
-        // Release: the committed sign's smoothed score fell below the release floor.
-        if (currentConf < RELEASE_THRESHOLD) {
-          return { sign: null, confidence: 0, isStable: false };
-        }
+    } else {
+      next = prev; // nothing to show, nothing changed
+    }
 
-        // Refresh confidence for the current sign (update % in UI).
-        if (prev.sign === topSign) {
-          return { ...prev, confidence: topConf, isStable: true };
-        }
+    // ── Sync to React state only when something meaningful changed ───────────
+    if (next !== prev) {
+      resultRef.current = next;
+      setResult(next);
+    }
 
-        // Keep showing the current sign while a new one is accumulating.
-        return { ...prev, confidence: currentConf };
-      }
-
-      // Case C: nothing committed yet — show candidate dimly once it passes threshold.
-      if (topSign !== null && topConf >= COMMIT_THRESHOLD) {
-        return { sign: topSign, confidence: topConf, isStable: false };
-      }
-
-      return prev;
-    });
+    return next; // synchronous return for same-frame consumers
   }, []);
 
   return { result, update };
 }
-
-/** Convenience: zero scores for when no hand is detected. */
-export { ZERO_SCORES };

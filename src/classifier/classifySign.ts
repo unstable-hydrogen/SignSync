@@ -1,390 +1,334 @@
 /**
- * classifySign.ts — heuristic ASL letter recognition
+ * classifySign.ts — Gesture Classification Layer
  *
- * Supported letters: A  B  D  F  I  L  V  W  Y
- * These were chosen because their hand shapes are geometrically distinct,
- * making heuristic separation reliable without an ML model.
+ * Receives a pre-extracted HandFeatures struct (one per frame) and returns a
+ * confidence score in [0, 1] for each supported ASL letter.
  *
- * ── Landmark map (MediaPipe 21-point hand model) ────────────────────────────
+ * ── Supported letters ───────────────────────────────────────────────────────
+ *   A  B  D  F  I  L  V  W  Y
+ *   Chosen because their hand shapes are geometrically distinct enough
+ *   for heuristic separation without an ML model.
  *
- *   0  WRIST
- *   1  THUMB_CMC   2  THUMB_MCP   3  THUMB_IP    4  THUMB_TIP
- *   5  INDEX_MCP   6  INDEX_PIP   7  INDEX_DIP   8  INDEX_TIP
- *   9  MIDDLE_MCP  10 MIDDLE_PIP  11 MIDDLE_DIP  12 MIDDLE_TIP
- *  13  RING_MCP    14 RING_PIP    15 RING_DIP    16 RING_TIP
- *  17  PINKY_MCP   18 PINKY_PIP   19 PINKY_DIP   20 PINKY_TIP
+ * ── Confidence scoring pattern ──────────────────────────────────────────────
+ * Each scorer computes several sub-scores (0–1) for individual geometric
+ * features, then returns their weighted average.
  *
- * ── Coordinate system ───────────────────────────────────────────────────────
- *   x ∈ [0,1]  left → right of the raw (un-mirrored) video frame
- *   y ∈ [0,1]  top → bottom  (larger y = lower on screen)
+ * "Soft veto" pattern:
+ *   if (primaryFeature < LOW_THRESHOLD) return primaryFeature * PENALTY
+ *   This caps the whole score when a defining feature is clearly absent,
+ *   without forcing a hard binary decision that ignores partial matches.
  *
- *   Therefore: a raised fingertip has tip.y < its mcp.y.
+ * ── Strongest geometric features for ASL ────────────────────────────────────
+ *   1. Finger extension (most discriminative — separates A/fist from B/4-up)
+ *   2. Thumb spread (separates I from Y, D from L, A from L)
+ *   3. Pinch distance (unique to F — thumb+index touching)
+ *   4. Which fingers are extended (V=2, W=3, B=4)
+ *   5. PIP-based curl (robust cross-check for tilted hands)
  *
- * ── Confidence formula ──────────────────────────────────────────────────────
- *   Each scorer returns 0–1.  Sub-scores are computed with geometry helpers
- *   (fingerExt, thumbSpread, dist, linearScore) and combined as weighted
- *   averages.  A "soft veto" pattern — "if primary feature < 0.25, cap the
- *   whole score" — prevents false positives without using hard binary logic.
+ * ── Letters that commonly overlap ───────────────────────────────────────────
+ *   I ↔ Y  — identical except thumb position (Y has thumb splayed)
+ *   D ↔ L  — identical except thumb position (L spread, D near middle)
+ *   V ↔ W  — V has ring curled, W has ring extended; one-finger difference
+ *   B ↔ W  — B has pinky extended, W has pinky curled; one-finger difference
  */
 
-import type { NormalizedLandmark } from "@mediapipe/tasks-vision";
-import {
-  dist, palmWidth, palmHeight, fingerExt, thumbSpread, linearScore,
-} from "./geometry";
-
-type NL = NormalizedLandmark;
+import { linearScore } from "./geometry";
+import type { HandFeatures } from "./features";
 
 export type Sign = "A" | "B" | "D" | "F" | "I" | "L" | "V" | "W" | "Y";
 export const ALL_SIGNS: Sign[] = ["A", "B", "D", "F", "I", "L", "V", "W", "Y"];
 export type ScoreMap = Record<Sign, number>;
 
-// ── Letter scorers ────────────────────────────────────────────────────────────
-//
-// Every scorer receives the full 21-landmark array plus pre-computed
-// palmHeight and palmWidth so those aren't recalculated per letter.
-//
-// Return value: confidence in [0, 1].
+/** All-zero scores — used when no hand is detected so EMA decays naturally. */
+export const ZERO_SCORES: ScoreMap =
+  Object.fromEntries(ALL_SIGNS.map(s => [s, 0])) as ScoreMap;
 
-// ─── A ───────────────────────────────────────────────────────────────────────
+// ── Letter scorers ────────────────────────────────────────────────────────────
+
 /**
  * A — Closed fist, thumb resting alongside the index finger.
  *
- * Visual: All four fingers curl tightly into the palm.
- *         Thumb is on the side (not wrapped over the top, not splayed out).
+ * Visual logic:
+ *   All four fingers curl tightly into the palm.  Thumb rests on the side,
+ *   neither wrapped over the top (S) nor splayed outward (L/Y).
  *
- * Key landmarks:
- *   fingertip.y > pip.y for every finger  → tip has dropped below mid-joint
- *   |thumbTip.x − indexMcp.x| small       → thumb is not spread to the side
- *
- * Math:
- *   curl(finger) = 1 − fingerExt(tip, mcp, palmH).
- *   fingerExt returns 0 when tip is at or below the knuckle → curl = 1 (good).
- *   Thumb spread < 0.30 normalised → thumb is alongside, not in L/Y territory.
+ * Key features:
+ *   • All four fingerCurl scores high (tipBelowPip adds a robustness cross-check)
+ *   • thumbSpreadRatio low — thumb is not flaring to the side
  *
  * Avoids overlap with:
- *   B / V / W — those need extended fingers (extScore would be high, curlScore low).
- *   I / Y     — those need pinky extended.
- *   L         — L needs thumb spread far to the side.
+ *   B/V/W  — those require extended fingers (fingerExt > 0.5)
+ *   I/Y    — those require pinky extended (pinkyCurl would be low)
+ *   L      — L needs thumbSpreadRatio > 0.4 (A penalises high spread)
  */
-function scoreA(lm: NL[], palmH: number, palmW: number): number {
-  const curlIdx = 1 - fingerExt(lm[8],  lm[5],  palmH);
-  const curlMid = 1 - fingerExt(lm[12], lm[9],  palmH);
-  const curlRng = 1 - fingerExt(lm[16], lm[13], palmH);
-  const curlPky = 1 - fingerExt(lm[20], lm[17], palmH);
+function scoreA(f: HandFeatures): number {
+  const { indexCurl, middleCurl, ringCurl, pinkyCurl,
+          indexTipBelowPip, middleTipBelowPip, ringTipBelowPip, pinkyTipBelowPip,
+          thumbSpreadRatio } = f;
 
-  // Soft veto: if any finger is visibly extended this can't be a fist.
-  const minCurl = Math.min(curlIdx, curlMid, curlRng, curlPky);
-  if (minCurl < 0.25) return minCurl * 0.4;
+  // Primary: all four fingers must be curled
+  const minCurl = Math.min(indexCurl, middleCurl, ringCurl, pinkyCurl);
+  if (minCurl < 0.20) return minCurl * 0.35; // soft veto
 
-  const fingerScore = (curlIdx + curlMid + curlRng + curlPky) / 4;
+  const curlScore = (indexCurl + middleCurl + ringCurl + pinkyCurl) / 4;
 
-  // Thumb should not splay — penalise if spread is large.
-  const tSpread     = thumbSpread(lm, palmW);
-  const thumbScore  = 1 - linearScore(tSpread, 0.15, 0.55);
+  // Secondary: PIP-based binary check — cross-validates the continuous score
+  const pipScore = (
+    (indexTipBelowPip  ? 1 : 0) +
+    (middleTipBelowPip ? 1 : 0) +
+    (ringTipBelowPip   ? 1 : 0) +
+    (pinkyTipBelowPip  ? 1 : 0)
+  ) / 4;
 
-  return 0.85 * fingerScore + 0.15 * thumbScore;
+  // Thumb: should not be splayed sideways (distinguishes A from L)
+  const thumbScore = 1 - linearScore(thumbSpreadRatio, 0.15, 0.55);
+
+  return 0.55 * curlScore + 0.30 * pipScore + 0.15 * thumbScore;
 }
 
-// ─── B ───────────────────────────────────────────────────────────────────────
 /**
  * B — Four fingers straight up, thumb folded across the palm.
  *
- * Visual: Index, middle, ring, pinky all point up and are held together.
- *         Thumb crosses over the palm toward the index side (not visible from front).
+ * Visual logic:
+ *   Index, middle, ring, pinky all point straight up and are held together.
+ *   Thumb crosses the palm (not visible from the front).
  *
- * Key landmarks:
- *   All four fingertips clearly above their MCPs → high extension scores.
- *   thumbTip.x ≈ indexMcp.x → thumb hasn't moved sideways.
- *
- * Math:
- *   fingerExt = (mcp.y − tip.y) / palmHeight.
- *   For B, this should be ≥ 0.5 for all four fingers.
- *   Thumb spread < 0.30 normalised → thumb is tucked in, not opened.
+ * Key features:
+ *   • All four fingerExt scores high
+ *   • thumbSpreadRatio low — thumb is across the palm, not to the side
  *
  * Avoids overlap with:
- *   W  — W has pinky curled; B's pinkyExt check separates them.
- *   V  — V has ring + pinky curled; B's ringExt + pinkyExt eliminate V.
- *   Open-5 — open hand has thumb spread; B's thumbScore penalises that.
+ *   W  — W has pinky curled; B's pinkyExt check handles this
+ *   V  — V has ring+pinky curled; B's ringExt+pinkyExt eliminate V
+ *   Open-5 — open hand has thumb spread outward; B's thumbScore penalises that
  */
-function scoreB(lm: NL[], palmH: number, palmW: number): number {
-  const extIdx = fingerExt(lm[8],  lm[5],  palmH);
-  const extMid = fingerExt(lm[12], lm[9],  palmH);
-  const extRng = fingerExt(lm[16], lm[13], palmH);
-  const extPky = fingerExt(lm[20], lm[17], palmH);
+function scoreB(f: HandFeatures): number {
+  const { indexExt, middleExt, ringExt, pinkyExt, thumbSpreadRatio } = f;
 
-  const minExt = Math.min(extIdx, extMid, extRng, extPky);
-  if (minExt < 0.30) return minExt * 0.5;
+  const minExt = Math.min(indexExt, middleExt, ringExt, pinkyExt);
+  if (minExt < 0.28) return minExt * 0.45;
 
-  const fingerScore = (extIdx + extMid + extRng + extPky) / 4;
-
-  const tSpread    = thumbSpread(lm, palmW);
-  const thumbScore = 1 - linearScore(tSpread, 0.10, 0.45);
+  const fingerScore = (indexExt + middleExt + ringExt + pinkyExt) / 4;
+  const thumbScore  = 1 - linearScore(thumbSpreadRatio, 0.10, 0.45);
 
   return 0.80 * fingerScore + 0.20 * thumbScore;
 }
 
-// ─── D ───────────────────────────────────────────────────────────────────────
 /**
- * D — Index pointing up, middle/ring/pinky curled into a ball, thumb alongside them.
+ * D — Index pointing up, others curl into a ball, thumb touches middle finger.
  *
- * Visual: Index finger extends upward (slightly curved in practice).
- *         Middle, ring, pinky curl together.
- *         Thumb touches or rests against the side of the middle finger, closing
- *         a circular shape with the index — the "D" profile.
+ * Visual logic:
+ *   Index extends upward.  Middle, ring, and pinky curl together into a ball.
+ *   Thumb tip touches or rests against the middle finger's PIP area,
+ *   closing a circle with the base of the index — the "D" profile.
  *
- * Key landmarks:
- *   indexTip well above indexMcp → high extension.
- *   middle/ring/pinkyTips below their PIPs → curled.
- *   dist(thumbTip, middlePip) small → thumb is near the middle finger.
- *
- * Math:
- *   thumbNearMiddle = 1 − linearScore(dist(lm[4], lm[10]) / palmW, 0.10, 0.45)
- *   This gives 1 when thumb tip is very close to middle PIP, 0 when far.
+ * Key features:
+ *   • indexExt high
+ *   • middle/ring/pinky curl high
+ *   • thumbMiddleDist low — thumb is near the curled middle finger
  *
  * Avoids overlap with:
- *   L — L requires thumb spread FAR to the side; D requires thumb NEAR middle.
- *   I — I has pinky up (not index) and thumb close to fist (different geometry).
+ *   L  — L requires thumbSpreadRatio high (far from palm); D requires thumb NEAR middle
+ *   I  — I has pinky extended (not index), and different thumb position
  */
-function scoreD(lm: NL[], palmH: number, palmW: number): number {
-  const extIdx  = fingerExt(lm[8],  lm[5],  palmH);
-  const curlMid = 1 - fingerExt(lm[12], lm[9],  palmH);
-  const curlRng = 1 - fingerExt(lm[16], lm[13], palmH);
-  const curlPky = 1 - fingerExt(lm[20], lm[17], palmH);
+function scoreD(f: HandFeatures): number {
+  const { indexExt, middleCurl, ringCurl, pinkyCurl, thumbMiddleDist } = f;
 
-  if (extIdx < 0.35) return extIdx * 0.4;
+  if (indexExt < 0.35) return indexExt * 0.4;
 
-  const otherCurl = (curlMid + curlRng + curlPky) / 3;
-  if (otherCurl < 0.35) return otherCurl * 0.4;
-
-  // Thumb tip distance to middle PIP, normalised.
-  const thumbToMidPip    = dist(lm[4], lm[10]) / palmW;
-  const thumbNearMiddle  = 1 - linearScore(thumbToMidPip, 0.10, 0.45);
-
-  return 0.30 * extIdx + 0.40 * otherCurl + 0.30 * thumbNearMiddle;
-}
-
-// ─── F ───────────────────────────────────────────────────────────────────────
-/**
- * F — Index + thumb pinch (touching tips), middle/ring/pinky extend upward.
- *
- * Visual: Index finger curls down and thumb comes up to meet it, forming a
- *         small circle (OK-like pinch) at the front.
- *         Middle, ring, and pinky fingers point straight up.
- *
- * Key landmarks:
- *   dist(thumbTip, indexTip) very small relative to palmWidth → pinch closed.
- *   middle/ring/pinky extension high.
- *   Index is NOT fully extended (it bends toward the thumb).
- *
- * Math:
- *   pinchDist = dist(lm[4], lm[8]) / palmW
- *   pinchScore = 1 − linearScore(pinchDist, 0.05, 0.30)
- *   High when tips are touching (< 5 % of palm width).
- *
- * Avoids overlap with:
- *   B — B has index fully extended, no pinch → pinchScore near 0 for B.
- *   W — W has index extended, ring also extended → different pattern.
- */
-function scoreF(lm: NL[], palmH: number, palmW: number): number {
-  const extMid  = fingerExt(lm[12], lm[9],  palmH);
-  const extRng  = fingerExt(lm[16], lm[13], palmH);
-  const extPky  = fingerExt(lm[20], lm[17], palmH);
-  const extIdx  = fingerExt(lm[8],  lm[5],  palmH);
-
-  const threeFingers = (extMid + extRng + extPky) / 3;
-  if (threeFingers < 0.35) return threeFingers * 0.3;
-
-  const pinchDist  = dist(lm[4], lm[8]) / palmW;
-  const pinchScore = 1 - linearScore(pinchDist, 0.05, 0.30);
-  if (pinchScore < 0.20) return pinchScore * 0.3;
-
-  // Index should be curled (bent toward thumb, not straight up).
-  const indexCurl = 1 - linearScore(extIdx, 0.0, 0.55);
-
-  return 0.35 * threeFingers + 0.45 * pinchScore + 0.20 * indexCurl;
-}
-
-// ─── I ───────────────────────────────────────────────────────────────────────
-/**
- * I — Only the pinky finger extended ("pinky power").
- *
- * Visual: Pinky points straight up.  Index, middle, ring curl into the palm.
- *         Thumb is held alongside the fist (not spread to the side).
- *
- * Key landmarks:
- *   pinkyTip well above pinkyMcp → high pinky extension.
- *   index/middle/ring curled → low extension scores.
- *   thumbSpread low → thumb not in Y-territory.
- *
- * Avoids overlap with:
- *   Y — Y also has pinky up BUT thumb is spread far to the side.
- *       The thumbScore term (penalising high spread) is the key separator.
- */
-function scoreI(lm: NL[], palmH: number, palmW: number): number {
-  const extPky  = fingerExt(lm[20], lm[17], palmH);
-  const curlIdx = 1 - fingerExt(lm[8],  lm[5],  palmH);
-  const curlMid = 1 - fingerExt(lm[12], lm[9],  palmH);
-  const curlRng = 1 - fingerExt(lm[16], lm[13], palmH);
-
-  if (extPky < 0.35) return extPky * 0.4;
-
-  const otherCurl = (curlIdx + curlMid + curlRng) / 3;
+  const otherCurl = (middleCurl + ringCurl + pinkyCurl) / 3;
   if (otherCurl < 0.30) return otherCurl * 0.4;
 
-  const tSpread    = thumbSpread(lm, palmW);
-  const thumbClose = 1 - linearScore(tSpread, 0.10, 0.55);
+  // Thumb near middle PIP — the defining circle of D
+  const thumbNearMiddle = 1 - linearScore(thumbMiddleDist, 0.10, 0.50);
 
-  return 0.35 * extPky + 0.50 * otherCurl + 0.15 * thumbClose;
+  return 0.28 * indexExt + 0.42 * otherCurl + 0.30 * thumbNearMiddle;
 }
 
-// ─── L ───────────────────────────────────────────────────────────────────────
 /**
- * L — Index pointing up, thumb extending sideways (the letter "L" shape).
+ * F — Index+thumb pinch (touching tips), middle/ring/pinky extend upward.
  *
- * Visual: Index finger points straight up.  Thumb extends horizontally to the
- *         side forming the corner of an L.  Middle, ring, pinky curl in.
+ * Visual logic:
+ *   The index curls down and the thumb meets it, forming a small circle
+ *   (like an OK sign but with the other three fingers straight up).
  *
- * Key landmarks:
- *   indexTip well above indexMcp → extension high.
- *   |thumbTip.x − indexMcp.x| / palmWidth large → thumb is far to the side.
- *   middle/ring/pinky curled.
- *
- * Math:
- *   thumbExtended = linearScore(thumbSpread, 0.35, 0.75)
- *   1.0 when the thumb tip is 75 % of a palm-width away from the index knuckle.
- *
- * Why mirroring doesn't matter: we take the absolute value of the x difference,
- * so the score is the same whether the user shows a left or right hand.
+ * Key features:
+ *   • thumbIndexPinch low — the two tips are close together
+ *   • middle/ring/pinky extended
+ *   • index NOT fully extended (it bends toward the thumb)
  *
  * Avoids overlap with:
- *   D — D has thumb near the middle finger, thumbSpread low → thumbExtended ≈ 0.
- *   Y — Y has pinky up instead of index, and index curled → extIdx low for Y.
+ *   B  — B has index extended, no pinch; pinchScore near 0 for B
+ *   W  — W has index extended with ring also up; different pattern entirely
  */
-function scoreL(lm: NL[], palmH: number, palmW: number): number {
-  const extIdx  = fingerExt(lm[8],  lm[5],  palmH);
-  const curlMid = 1 - fingerExt(lm[12], lm[9],  palmH);
-  const curlRng = 1 - fingerExt(lm[16], lm[13], palmH);
-  const curlPky = 1 - fingerExt(lm[20], lm[17], palmH);
+function scoreF(f: HandFeatures): number {
+  const { middleExt, ringExt, pinkyExt, indexExt, thumbIndexPinch } = f;
 
-  if (extIdx < 0.35) return extIdx * 0.4;
+  const threeFingers = (middleExt + ringExt + pinkyExt) / 3;
+  if (threeFingers < 0.35) return threeFingers * 0.3;
 
-  const otherCurl    = (curlMid + curlRng + curlPky) / 3;
-  const tSpread      = thumbSpread(lm, palmW);
-  const thumbOut     = linearScore(tSpread, 0.35, 0.75);
+  // Pinch: thumb tip close to index tip
+  const pinchScore = 1 - linearScore(thumbIndexPinch, 0.04, 0.28);
+  if (pinchScore < 0.20) return pinchScore * 0.3;
+
+  // Index should be partially curled (bending toward thumb, not straight up)
+  const indexCurled = 1 - linearScore(indexExt, 0.0, 0.60);
+
+  return 0.35 * threeFingers + 0.45 * pinchScore + 0.20 * indexCurled;
+}
+
+/**
+ * I — Only the pinky extended, others curled, thumb tucked.
+ *
+ * Visual logic:
+ *   Pinky points straight up; all other fingers and thumb are folded into a fist.
+ *   Also called "pinky salute" or the letter I in one-handed fingerspelling.
+ *
+ * Key features:
+ *   • pinkyExt high
+ *   • index/middle/ring all curled
+ *   • thumbSpreadRatio low — critical for separating I from Y
+ *
+ * Avoids overlap with:
+ *   Y  — Y also has pinky extended BUT thumb is splayed sideways.
+ *         The (1 − thumbSpreadRatio) term is the sole discriminator.
+ */
+function scoreI(f: HandFeatures): number {
+  const { pinkyExt, indexCurl, middleCurl, ringCurl, thumbSpreadRatio } = f;
+
+  if (pinkyExt < 0.35) return pinkyExt * 0.4;
+
+  const otherCurl = (indexCurl + middleCurl + ringCurl) / 3;
+  if (otherCurl < 0.28) return otherCurl * 0.4;
+
+  // Thumb must NOT be spread — this is what separates I from Y
+  const thumbClose = 1 - linearScore(thumbSpreadRatio, 0.10, 0.55);
+
+  return 0.35 * pinkyExt + 0.50 * otherCurl + 0.15 * thumbClose;
+}
+
+/**
+ * L — Index pointing up, thumb extending horizontally to the side.
+ *
+ * Visual logic:
+ *   Index points up, thumb extends to the side, forming a 90° "L" shape.
+ *   Middle, ring, and pinky curl into the palm.
+ *
+ * Key features:
+ *   • indexExt high
+ *   • thumbSpreadRatio large — thumb is far from the palm
+ *   • middle/ring/pinky curled
+ *
+ * Why mirroring doesn't matter:
+ *   thumbSpreadRatio = |thumbTip.x − indexMcp.x| / palmW.
+ *   The absolute value makes this invariant to left/right hand orientation.
+ *
+ * Avoids overlap with:
+ *   D  — D has thumbMiddleDist low (thumb near middle); L has thumbSpreadRatio high
+ *   Y  — Y has pinky up (not index); indexCurl would be high for Y
+ */
+function scoreL(f: HandFeatures): number {
+  const { indexExt, middleCurl, ringCurl, pinkyCurl, thumbSpreadRatio } = f;
+
+  if (indexExt < 0.35) return indexExt * 0.4;
+
+  const otherCurl  = (middleCurl + ringCurl + pinkyCurl) / 3;
+  const thumbOut   = linearScore(thumbSpreadRatio, 0.35, 0.78);
 
   if (thumbOut < 0.20) return thumbOut * 0.4;
 
-  return 0.30 * extIdx + 0.35 * otherCurl + 0.35 * thumbOut;
+  return 0.28 * indexExt + 0.37 * otherCurl + 0.35 * thumbOut;
 }
 
-// ─── V ───────────────────────────────────────────────────────────────────────
 /**
- * V — Index and middle extended and spread apart (peace sign / scissors).
+ * V — Index and middle extended and spread apart (peace / scissors).
  *
- * Visual: Index and middle point up, spread into a V shape.
- *         Ring and pinky curl in.  Thumb is tucked or slightly open.
+ * Visual logic:
+ *   Index and middle point up and fan apart into a V shape.
+ *   Ring and pinky curl in.  Thumb is tucked or neutral.
  *
- * Key landmarks:
- *   indexTip and middleTip both above their MCPs → both extended.
- *   ring and pinky curled.
- *   Horizontal gap between indexTip and middleTip > ~15 % of palm width.
- *
- * Math:
- *   fingerSpread = |indexTip.x − middleTip.x| / palmWidth
- *   spreadScore = linearScore(fingerSpread, 0.05, 0.25)
- *   This rewards the V shape's characteristic spread and helps avoid confusion
- *   with U (two fingers together), though U is not in our set.
+ * Key features:
+ *   • indexExt and middleExt both high
+ *   • ringCurl and pinkyCurl high
+ *   • indexMiddleSpread — horizontal gap between the two extended tips
+ *     distinguishes V (spread) from U (together), though U is not in our set
  *
  * Avoids overlap with:
- *   B — B has ring + pinky extended; V's curlRng + curlPky check handles this.
- *   W — W has ring also extended; curlRng eliminates W when ring is up.
+ *   B  — B has ring+pinky also extended; V's curlRng+curlPky check handles this
+ *   W  — W has ring extended; V's ringCurl check eliminates W
  */
-function scoreV(lm: NL[], palmH: number, palmW: number): number {
-  const extIdx  = fingerExt(lm[8],  lm[5],  palmH);
-  const extMid  = fingerExt(lm[12], lm[9],  palmH);
-  const curlRng = 1 - fingerExt(lm[16], lm[13], palmH);
-  const curlPky = 1 - fingerExt(lm[20], lm[17], palmH);
+function scoreV(f: HandFeatures): number {
+  const { indexExt, middleExt, ringCurl, pinkyCurl, indexMiddleSpread } = f;
 
-  const minExt = Math.min(extIdx, extMid);
-  if (minExt < 0.35) return minExt * 0.4;
+  const minTwoExt = Math.min(indexExt, middleExt);
+  if (minTwoExt < 0.35) return minTwoExt * 0.4;
 
-  const curlScore = (curlRng + curlPky) / 2;
+  const curlScore   = (ringCurl + pinkyCurl) / 2;
   if (curlScore < 0.25) return curlScore * 0.4;
 
-  // The spread between index and middle distinguishes V from a collapsed 2-finger pose.
-  const fingerSpread = Math.abs(lm[8].x - lm[12].x) / palmW;
-  const spreadScore  = linearScore(fingerSpread, 0.05, 0.25);
+  // Spread between index and middle — rewards the characteristic V gap
+  const spreadScore = linearScore(indexMiddleSpread, 0.05, 0.28);
 
-  return 0.35 * ((extIdx + extMid) / 2) + 0.40 * curlScore + 0.25 * spreadScore;
+  return 0.35 * ((indexExt + middleExt) / 2) + 0.40 * curlScore + 0.25 * spreadScore;
 }
 
-// ─── W ───────────────────────────────────────────────────────────────────────
 /**
  * W — Index, middle, ring all extended; pinky curled; thumb folded.
  *
- * Visual: Three middle fingers (index, middle, ring) fan open and point up,
- *         slightly spread to show the W shape.  Pinky curls down.
- *         Thumb is folded across the palm.
+ * Visual logic:
+ *   Three fingers (index, middle, ring) fan upward slightly.
+ *   Pinky curls in.  Thumb stays close to the palm.
  *
- * Key landmarks:
- *   Index, middle, ring: high extension scores.
- *   Pinky: curled (low extension).
- *   thumbSpread low (thumb not flaring out).
+ * Key features:
+ *   • indexExt, middleExt, ringExt all high
+ *   • pinkyCurl high — the key difference from B (which has all four)
+ *   • thumbSpreadRatio low (thumb not flaring)
  *
  * Avoids overlap with:
- *   B — B has pinky extended; W's curlPky check removes that ambiguity.
- *   V — V has ring curled; W's extRng check removes V when ring is up.
+ *   B  — B has pinky extended; W's pinkyCurl check handles this
+ *   V  — V has ring curled; W's ringExt check eliminates V when ring is up
  */
-function scoreW(lm: NL[], palmH: number, palmW: number): number {
-  const extIdx  = fingerExt(lm[8],  lm[5],  palmH);
-  const extMid  = fingerExt(lm[12], lm[9],  palmH);
-  const extRng  = fingerExt(lm[16], lm[13], palmH);
-  const curlPky = 1 - fingerExt(lm[20], lm[17], palmH);
+function scoreW(f: HandFeatures): number {
+  const { indexExt, middleExt, ringExt, pinkyCurl, thumbSpreadRatio } = f;
 
-  const minThree = Math.min(extIdx, extMid, extRng);
-  if (minThree < 0.30) return minThree * 0.4;
-  if (curlPky  < 0.30) return curlPky  * 0.4;
+  const minThree = Math.min(indexExt, middleExt, ringExt);
+  if (minThree < 0.28) return minThree * 0.4;
+  if (pinkyCurl  < 0.28) return pinkyCurl  * 0.4;
 
-  const threeScore = (extIdx + extMid + extRng) / 3;
-  const tSpread    = thumbSpread(lm, palmW);
-  const thumbClose = 1 - linearScore(tSpread, 0.10, 0.50);
+  const threeScore = (indexExt + middleExt + ringExt) / 3;
+  const thumbClose = 1 - linearScore(thumbSpreadRatio, 0.10, 0.50);
 
-  return 0.60 * threeScore + 0.30 * curlPky + 0.10 * thumbClose;
+  return 0.60 * threeScore + 0.30 * pinkyCurl + 0.10 * thumbClose;
 }
 
-// ─── Y ───────────────────────────────────────────────────────────────────────
 /**
- * Y — Pinky extended up + thumb extended sideways (shaka / hang-loose).
+ * Y — Pinky extended up + thumb spread sideways (shaka / hang-loose).
  *
- * Visual: Pinky points up.  Thumb extends horizontally to the side.
- *         Index, middle, ring curl into the palm.
- *         The pinky and thumb together form the Y silhouette.
+ * Visual logic:
+ *   Pinky points up, thumb extends horizontally to the side.
+ *   Index, middle, ring curl into the palm.
+ *   The pinky and thumb together trace the Y shape.
  *
- * Key landmarks:
- *   pinkyTip well above pinkyMcp → pinky extended.
- *   thumbSpread large → thumb is far to the side.
- *   index/middle/ring curled.
+ * Key features:
+ *   • pinkyExt high
+ *   • thumbSpreadRatio large — this is what distinguishes Y from I
+ *   • index/middle/ring curled
  *
  * Avoids overlap with:
- *   I — I has ONLY pinky extended but thumb NOT spread (thumbOut ≈ 0 for I).
- *       The thumbOut factor is the sole discriminator between I and Y.
- *   L — L has index extended (not pinky) and others curled.
+ *   I  — I has ONLY pinky up with thumb NOT spread; thumbSpreadRatio low for I
+ *   L  — L has index up (not pinky); indexCurl would be high for L hand poses
  */
-function scoreY(lm: NL[], palmH: number, palmW: number): number {
-  const extPky  = fingerExt(lm[20], lm[17], palmH);
-  const curlIdx = 1 - fingerExt(lm[8],  lm[5],  palmH);
-  const curlMid = 1 - fingerExt(lm[12], lm[9],  palmH);
-  const curlRng = 1 - fingerExt(lm[16], lm[13], palmH);
+function scoreY(f: HandFeatures): number {
+  const { pinkyExt, indexCurl, middleCurl, ringCurl, thumbSpreadRatio } = f;
 
-  if (extPky < 0.30) return extPky * 0.4;
+  if (pinkyExt < 0.30) return pinkyExt * 0.4;
 
-  const otherCurl = (curlIdx + curlMid + curlRng) / 3;
-  const tSpread   = thumbSpread(lm, palmW);
-  const thumbOut  = linearScore(tSpread, 0.35, 0.70);
+  const otherCurl = (indexCurl + middleCurl + ringCurl) / 3;
+  const thumbOut  = linearScore(thumbSpreadRatio, 0.35, 0.72);
 
   if (thumbOut < 0.15) return thumbOut * 0.4;
 
-  return 0.30 * extPky + 0.35 * otherCurl + 0.35 * thumbOut;
+  return 0.30 * pinkyExt + 0.35 * otherCurl + 0.35 * thumbOut;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -392,25 +336,15 @@ function scoreY(lm: NL[], palmH: number, palmW: number): number {
 /**
  * scoreAllLetters — run every letter scorer and return a confidence map.
  *
- * Call this once per frame with the 21 landmarks of ONE hand.
- * Returns a Record mapping each Sign to its 0–1 confidence.
- * All scores will be 0 if the landmark array is incomplete.
+ * Input:  HandFeatures extracted from one hand's 21 landmarks.
+ * Output: ScoreMap — confidence in [0, 1] for every supported letter.
+ *
+ * Call this once per animation frame per detected hand.
  */
-export function scoreAllLetters(lm: NL[]): ScoreMap {
-  if (lm.length < 21) {
-    return Object.fromEntries(ALL_SIGNS.map(s => [s, 0])) as ScoreMap;
-  }
-  const palmH = palmHeight(lm);
-  const palmW = palmWidth(lm);
+export function scoreAllLetters(f: HandFeatures): ScoreMap {
   return {
-    A: scoreA(lm, palmH, palmW),
-    B: scoreB(lm, palmH, palmW),
-    D: scoreD(lm, palmH, palmW),
-    F: scoreF(lm, palmH, palmW),
-    I: scoreI(lm, palmH, palmW),
-    L: scoreL(lm, palmH, palmW),
-    V: scoreV(lm, palmH, palmW),
-    W: scoreW(lm, palmH, palmW),
-    Y: scoreY(lm, palmH, palmW),
+    A: scoreA(f), B: scoreB(f), D: scoreD(f),
+    F: scoreF(f), I: scoreI(f), L: scoreL(f),
+    V: scoreV(f), W: scoreW(f), Y: scoreY(f),
   };
 }
