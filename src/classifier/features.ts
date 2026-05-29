@@ -39,6 +39,7 @@
 
 import type { NormalizedLandmark } from "@mediapipe/tasks-vision";
 import { dist, palmWidth, palmHeight, fingerExt, thumbSpread } from "./geometry";
+import { normalizeHand } from "./normalize";
 
 type NL = NormalizedLandmark;
 
@@ -81,8 +82,12 @@ export interface HandFeatures {
  * extractFeatures — convert 21 raw landmarks into a HandFeatures struct.
  * Returns null if the landmark array is incomplete (< 21 points).
  */
-export function extractFeatures(lm: NL[]): HandFeatures | null {
-  if (lm.length < 21) return null;
+export function extractFeatures(rawLm: NL[]): HandFeatures | null {
+  if (rawLm.length < 21) return null;
+
+  // Z-score normalize per axis before any geometric computation.
+  // Adapted from Kaggle ASL 1st-place: per-body-part normalization in model forward().
+  const lm = normalizeHand(rawLm);
 
   const palmH = palmHeight(lm);
   const palmW  = palmWidth(lm);

@@ -35,8 +35,15 @@
 import { linearScore } from "./geometry";
 import type { HandFeatures } from "./features";
 
-export type Sign = "A" | "B" | "D" | "F" | "I" | "L" | "V" | "W" | "Y";
-export const ALL_SIGNS: Sign[] = ["A", "B", "D", "F", "I", "L", "V", "W", "Y"];
+export type Sign =
+  "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" |
+  "K" | "L" | "M" | "N" | "O" | "P" | "Q" | "R" | "S" | "T" |
+  "U" | "V" | "W" | "X" | "Y" | "Z";
+export const ALL_SIGNS: Sign[] = [
+  "A","B","C","D","E","F","G","H","I","J",
+  "K","L","M","N","O","P","Q","R","S","T",
+  "U","V","W","X","Y","Z",
+];
 export type ScoreMap = Record<Sign, number>;
 
 /** All-zero scores — used when no hand is detected so EMA decays naturally. */
@@ -64,11 +71,15 @@ export const ZERO_SCORES: ScoreMap =
 function scoreA(f: HandFeatures): number {
   const { indexCurl, middleCurl, ringCurl, pinkyCurl,
           indexTipBelowPip, middleTipBelowPip, ringTipBelowPip, pinkyTipBelowPip,
-          thumbSpreadRatio } = f;
+          thumbSpreadRatio, thumbIndexPinch } = f;
 
   // Primary: all four fingers must be curled
   const minCurl = Math.min(indexCurl, middleCurl, ringCurl, pinkyCurl);
   if (minCurl < 0.20) return minCurl * 0.35; // soft veto
+
+  // If thumb tip is close to index tip the pose is O, not A.
+  // A's thumb rests on the side of the index — it does NOT reach the fingertip.
+  if (thumbIndexPinch < 0.22) return thumbIndexPinch * 1.8; // hard cap ≈ 0.40
 
   const curlScore = (indexCurl + middleCurl + ringCurl + pinkyCurl) / 4;
 
@@ -331,6 +342,113 @@ function scoreY(f: HandFeatures): number {
   return 0.30 * pinkyExt + 0.35 * otherCurl + 0.35 * thumbOut;
 }
 
+/**
+ * C — All four fingers arc into a gentle curve (like holding a ball).
+ *
+ * Visual logic:
+ *   None of the fingers are fully extended or fully curled.
+ *   They all rest in the 0.25–0.70 extension range, tracing the arc of the letter C.
+ *   The thumb extends outward to complete the curve, giving a medium spread ratio.
+ *
+ * Key features:
+ *   • All four fingerExt in mid-range (not a fist, not a flat hand)
+ *   • thumbSpreadRatio moderate — thumb arcs away to match the curve
+ *
+ * Avoids overlap with:
+ *   A/S  — those have all fingers fully curled (ext ≈ 0)
+ *   B    — B has all fingers fully extended (ext ≈ 1)
+ *   O    — O has all fingers tightly curled AND thumb meeting index
+ */
+function scoreC(f: HandFeatures): number {
+  const { indexExt, middleExt, ringExt, pinkyExt, thumbSpreadRatio } = f;
+
+  const avgExt = (indexExt + middleExt + ringExt + pinkyExt) / 4;
+  const maxExt = Math.max(indexExt, middleExt, ringExt, pinkyExt);
+  const minExt = Math.min(indexExt, middleExt, ringExt, pinkyExt);
+
+  // Soft veto: too flat (B-like) or too closed (A-like)
+  if (maxExt < 0.15) return maxExt * 0.3;
+  if (minExt > 0.80) return (1 - minExt) * 0.3;
+
+  // Best C when avg extension is near the midpoint (≈0.40–0.55)
+  const midScore = 1 - linearScore(Math.abs(avgExt - 0.45), 0.0, 0.28);
+
+  // Thumb arcs out moderately
+  const thumbScore = linearScore(thumbSpreadRatio, 0.18, 0.60);
+
+  return 0.65 * midScore + 0.35 * thumbScore;
+}
+
+/**
+ * O — All fingers tightly curled, thumb tip meets index tip to close a circle.
+ *
+ * Visual logic:
+ *   Every finger curls inward, and the thumb rounds up to touch the index fingertip,
+ *   forming a tight closed circle — the letter O.
+ *
+ * Key features:
+ *   • All four fingerCurl high (≥ 0.55) — tighter than C
+ *   • thumbIndexPinch very low — thumb tip is touching index tip
+ *
+ * Avoids overlap with:
+ *   A    — A also has tight curl, but thumb rests on the side (no pinch)
+ *   C    — C has fingers in mid-range extension, not tight curl
+ *   F    — F only curls the index; middle/ring/pinky extend
+ */
+function scoreO(f: HandFeatures): number {
+  const { indexCurl, middleCurl, ringCurl, pinkyCurl, thumbIndexPinch } = f;
+
+  const minCurl = Math.min(indexCurl, middleCurl, ringCurl, pinkyCurl);
+  if (minCurl < 0.28) return minCurl * 0.4; // fingers clearly not curled
+
+  // Thumb rounds up to meet index tip — the defining feature of O.
+  // Range widened: thumb doesn't need to be perfectly touching, just clearly close.
+  const pinchScore = 1 - linearScore(thumbIndexPinch, 0.04, 0.50);
+  if (pinchScore < 0.10) return pinchScore * 0.3;
+
+  const curlScore = (indexCurl + middleCurl + ringCurl + pinkyCurl) / 4;
+
+  return 0.40 * curlScore + 0.60 * pinchScore;
+}
+
+/**
+ * U — Index and middle extended close together (no V-spread); ring and pinky curled.
+ *
+ * Visual logic:
+ *   Exactly like V but with index and middle held parallel and touching,
+ *   rather than fanned apart into a V shape.
+ *
+ * Key features:
+ *   • indexExt and middleExt both high
+ *   • ringCurl and pinkyCurl high (same as V)
+ *   • indexMiddleSpread very LOW — the defining difference from V
+ *
+ * Avoids overlap with:
+ *   V  — V has indexMiddleSpread high (fingers fanned); the spread term discriminates
+ *   B  — B also has ring+pinky extended; U's curlScore check handles this
+ */
+function scoreU(f: HandFeatures): number {
+  const { indexExt, middleExt, ringCurl, pinkyCurl, indexMiddleSpread, thumbSpreadRatio } = f;
+
+  const minTwoExt = Math.min(indexExt, middleExt);
+  if (minTwoExt < 0.40) return minTwoExt * 0.4;
+
+  const curlScore = (ringCurl + pinkyCurl) / 2;
+  if (curlScore < 0.28) return curlScore * 0.4;
+
+  // Fingers must be held together — this is what separates U from V
+  const togetherScore = 1 - linearScore(indexMiddleSpread, 0.03, 0.20);
+  if (togetherScore < 0.15) return togetherScore * 0.4;
+
+  // Thumb should not be splayed (distinguishes U from L)
+  const thumbClose = 1 - linearScore(thumbSpreadRatio, 0.12, 0.50);
+
+  return 0.30 * ((indexExt + middleExt) / 2)
+       + 0.28 * curlScore
+       + 0.30 * togetherScore
+       + 0.12 * thumbClose;
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
@@ -342,9 +460,16 @@ function scoreY(f: HandFeatures): number {
  * Call this once per animation frame per detected hand.
  */
 export function scoreAllLetters(f: HandFeatures): ScoreMap {
+  const zero = 0;
   return {
-    A: scoreA(f), B: scoreB(f), D: scoreD(f),
-    F: scoreF(f), I: scoreI(f), L: scoreL(f),
-    V: scoreV(f), W: scoreW(f), Y: scoreY(f),
+    A: scoreA(f), B: scoreB(f), C: scoreC(f),
+    D: scoreD(f), E: zero,      F: scoreF(f),
+    G: zero,      H: zero,      I: scoreI(f),
+    J: zero,      K: zero,      L: scoreL(f),
+    M: zero,      N: zero,      O: scoreO(f),
+    P: zero,      Q: zero,      R: zero,
+    S: zero,      T: zero,      U: scoreU(f),
+    V: scoreV(f), W: scoreW(f), X: zero,
+    Y: scoreY(f), Z: zero,
   };
 }

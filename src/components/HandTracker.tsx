@@ -24,6 +24,10 @@ import { useStableSign }   from "../hooks/useStableSign";
 import { useWordBuilder }  from "../hooks/useWordBuilder";
 import { extractFeatures } from "../classifier/features";
 import { scoreAllLetters, ZERO_SCORES, type Sign } from "../classifier/classifySign";
+import { StabilityGate }   from "../classifier/stabilityGate";
+import { loadModel, isModelReady, predictLandmarks } from "../classifier/mlModel";
+import { normalizeHand } from "../classifier/normalize";
+import { useCollector }  from "../hooks/useCollector";
 
 export function HandTracker() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -31,6 +35,18 @@ export function HandTracker() {
 
   const { result, update: updateStable } = useStableSign();
   const { word, holdProgress, tick: wordTick, addSpace, backspace, clear } = useWordBuilder();
+  const { state: col, toggle: colToggle, pickTarget, capture, exportCSV, undo } = useCollector();
+
+  // Keep a ref to the latest landmarks so the key handler can read them synchronously
+  const latestLmRef = useRef<NormalizedLandmark[] | null>(null);
+
+  // Start loading the trained ML model immediately (non-blocking).
+  useEffect(() => { loadModel(); }, []);
+
+  // Stability gate — adapted from snrao gestureStatic pattern.
+  // Classification only runs after the hand has been still for STABLE_FRAMES;
+  // moving hands pass ZERO_SCORES so the EMA decays cleanly.
+  const gateRef = useRef(new StabilityGate());
 
   /**
    * onLandmarks — called every animation frame by useHandTracking.
@@ -41,10 +57,32 @@ export function HandTracker() {
    */
   const onLandmarks = useCallback(
     (landmarkSets: NormalizedLandmark[][]) => {
-      const lm       = landmarkSets[0]; // classify first detected hand only
-      const features = lm ? extractFeatures(lm) : null;
-      const scores   = features ? scoreAllLetters(features) : ZERO_SCORES;
-      const stable   = updateStable(scores); // returns new result synchronously
+      const lm   = landmarkSets[0]; // classify first detected hand only
+      latestLmRef.current = lm ?? null;
+      const gate = gateRef.current;
+
+      // Only score when the hand has been still long enough (snrao gestureStatic pattern).
+      const isStill  = lm ? gate.check(lm) : (gate.reset(), false);
+
+      let scores = ZERO_SCORES;
+      if (lm && isStill) {
+        if (isModelReady()) {
+          // ML model path: z-score normalise then run trained MLP
+          const normed = normalizeHand(lm);
+          const xs = new Float32Array(normed.map(p => p.x));
+          const ys = new Float32Array(normed.map(p => p.y));
+          const zs = new Float32Array(normed.map(p => p.z ?? 0));
+          const flat = new Float32Array(63);
+          flat.set(xs, 0); flat.set(ys, 21); flat.set(zs, 42);
+          scores = (predictLandmarks(flat) as typeof ZERO_SCORES) ?? ZERO_SCORES;
+        } else {
+          // Heuristic fallback until model is loaded
+          const features = extractFeatures(lm);
+          scores = features ? scoreAllLetters(features) : ZERO_SCORES;
+        }
+      }
+
+      const stable = updateStable(scores);
       wordTick(stable.sign, stable.isStable);
     },
     [updateStable, wordTick]
@@ -52,16 +90,45 @@ export function HandTracker() {
 
   const status = useHandTracking(videoRef, canvasRef, onLandmarks);
 
-  // Keyboard shortcuts — Space, Backspace, Escape
+  // Keyboard shortcuts
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Tab — toggle collection mode
+      if (e.key === "Tab") {
+        e.preventDefault();
+        colToggle();
+        return;
+      }
+
+      if (col.active) {
+        // A-Z — pick target letter
+        if (/^[a-zA-Z]$/.test(e.key)) {
+          e.preventDefault();
+          pickTarget(e.key.toUpperCase());
+          return;
+        }
+        // Enter — capture current landmarks
+        if (e.key === "Enter") {
+          e.preventDefault();
+          const lm = latestLmRef.current;
+          if (lm) capture(lm);
+          return;
+        }
+        // Backspace — undo last sample
+        if (e.key === "Backspace") { e.preventDefault(); undo(); return; }
+        // E — export CSV
+        if (e.key === "e" || e.key === "E") { e.preventDefault(); exportCSV(); return; }
+        return; // swallow other keys in collect mode
+      }
+
+      // Normal mode shortcuts
       if (e.key === " ")         { e.preventDefault(); addSpace();  }
       if (e.key === "Backspace") { e.preventDefault(); backspace(); }
       if (e.key === "Escape")    { e.preventDefault(); clear();     }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [addSpace, backspace, clear]);
+  }, [col.active, colToggle, pickTarget, capture, undo, exportCSV, addSpace, backspace, clear]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 0 }}>
@@ -106,13 +173,30 @@ export function HandTracker() {
         )}
       </div>
 
+      {/* ── Collect panel ────────────────────────────────────────────── */}
+      {col.active && (
+        <CollectPanel
+          target={col.target}
+          counts={col.counts}
+          total={col.total}
+          onExport={exportCSV}
+        />
+      )}
+
+      {/* Tab hint when not in collect mode */}
+      {!col.active && (
+        <div style={{ fontSize: 10, color: "#333", marginTop: 2 }}>
+          Tab → collect mode
+        </div>
+      )}
+
       {/* ── Word panel ─────────────────────────────────────────────────── */}
-      <WordPanel
+      {!col.active && <WordPanel
         word={word}
         onSpace={addSpace}
         onBackspace={backspace}
         onClear={clear}
-      />
+      />}
     </div>
   );
 }
@@ -304,6 +388,81 @@ const cameraContainerStyle: React.CSSProperties = {
   borderBottom: "none",
   background:   "#1a1a1a",
 };
+
+// ── CollectPanel ──────────────────────────────────────────────────────────────
+
+const ALL_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+
+interface CollectPanelProps {
+  target:   string | null;
+  counts:   Record<string, number>;
+  total:    number;
+  onExport: () => void;
+}
+
+function CollectPanel({ target, counts, total, onExport }: CollectPanelProps) {
+  return (
+    <div style={{
+      width: 636, background: "#0d1117", border: "2px solid #f59e0b",
+      borderRadius: "0 0 8px 8px", padding: "12px 20px 14px",
+    }}>
+      {/* Header */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <span style={{ color: "#f59e0b", fontWeight: 700, fontSize: 13, letterSpacing: "0.08em" }}>
+          COLLECT MODE &nbsp;<span style={{ color: "#555", fontWeight: 400 }}>Tab to exit</span>
+        </span>
+        <button
+          onClick={onExport}
+          style={{
+            background: "#1e3a5f", border: "1px solid #3b82f6", borderRadius: 5,
+            color: "#93c5fd", fontSize: 11, padding: "3px 10px", cursor: "pointer",
+          }}
+        >
+          Export CSV &nbsp;<kbd style={{ fontSize: 9, color: "#555" }}>E</kbd>
+        </button>
+      </div>
+
+      {/* Target display */}
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 10 }}>
+        <span style={{ color: "#888", fontSize: 12 }}>Target:</span>
+        <span style={{ fontSize: 40, fontWeight: 700, color: target ? "#f59e0b" : "#333", lineHeight: 1 }}>
+          {target ?? "—"}
+        </span>
+        <span style={{ color: "#555", fontSize: 11 }}>
+          {target
+            ? `${counts[target] ?? 0} samples · press Enter to capture`
+            : "press a letter key to set target"}
+        </span>
+      </div>
+
+      {/* Per-letter count grid */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+        {ALL_LETTERS.map(l => {
+          const n   = counts[l] ?? 0;
+          const hot = l === target;
+          return (
+            <div key={l} style={{
+              width: 38, textAlign: "center", borderRadius: 4, padding: "3px 0",
+              background: hot ? "#451a03" : n > 0 ? "#1a2a1a" : "#141414",
+              border: `1px solid ${hot ? "#f59e0b" : n > 0 ? "#22c55e44" : "#222"}`,
+            }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: hot ? "#f59e0b" : n > 0 ? "#4ade80" : "#444" }}>
+                {l}
+              </div>
+              <div style={{ fontSize: 10, color: hot ? "#d97706" : "#555" }}>{n}</div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Total */}
+      <div style={{ marginTop: 8, fontSize: 11, color: "#555" }}>
+        Total samples: <span style={{ color: "#888" }}>{total}</span>
+        &nbsp;·&nbsp;Backspace to undo last
+      </div>
+    </div>
+  );
+}
 
 const wordPanelStyle: React.CSSProperties = {
   width:        636,    // accounts for 2px border on each side
